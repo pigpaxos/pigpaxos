@@ -1,0 +1,13 @@
+bin/*
+!bin/*.sh
+!bin/*.py
+!bin/*.json
+tla/*
+!tla/wpaxos.tla
+aws
+ppaxos
+cosmos
+.idea/*
+/bin/testbp.sh
+/bin/config-az.json
+/bin/config_bigpaxos*
