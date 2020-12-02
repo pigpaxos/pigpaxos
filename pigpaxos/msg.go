@@ -105,38 +105,37 @@ type P2a struct {
 }
 
 func (m P2a) String() string {
-	return fmt.Sprintf("P2a {b=%v s=%d cmd=%v, globalExecute=%d, p3Msg=%v}", m.Ballot, m.Slot, m.Command, m.GlobalExecute, m.P3msg)
+	return fmt.Sprintf("P2a {b=%v s=%d cmd=%v, p3Msg=%v}", m.Ballot, m.Slot, m.Command, m.P3msg)
 }
 
 
 // P3 commit message
 type P3 struct {
 	Ballot  paxi.Ballot
-	//Slot    []int
-	LastExecutedSlot int
+	Slot    []int
 	//Command paxi.Command
 }
 
 func (m P3) String() string {
-	return fmt.Sprintf("P3 {b=%v, last_exec=%d}",  m.Ballot,  m.LastExecutedSlot)
+	return fmt.Sprintf("P3 {b=%v slots=%d}",  m.Ballot, m.Slot)
 }
 
 type P3RecoverRequest struct {
 	Ballot paxi.Ballot
-	Slots  []int
+	Slot   int
 	NodeId paxi.ID
 }
 
 func (m P3RecoverRequest) String() string {
-	return fmt.Sprintf("P3RecoverRequest {b=%v Slots=%v, nodeToRecover=%v}",  m.Ballot, m.Slots, m.NodeId)
+	return fmt.Sprintf("P3RecoverRequest {b=%v slots=%d, nodeToRecover=%v}",  m.Ballot, m.Slot, m.NodeId)
 }
 
 type P3RecoverReply struct {
-	Ballot    paxi.Ballot
-	Slots     []int
-	Commands  []paxi.Command
+	Ballot  paxi.Ballot
+	Slot    int
+	Command paxi.Command
 }
 
 func (m P3RecoverReply) String() string {
-	return fmt.Sprintf("P3RecoverReply {b=%v slots=%v, cmd=%v}",  m.Ballot, m.Slots, m.Commands)
+	return fmt.Sprintf("P3RecoverReply {b=%v slots=%d, cmd=%v}",  m.Ballot, m.Slot, m.Command)
 }

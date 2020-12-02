@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const GrayTimeoutMultiplier = 100
+const GrayTimeoutMultiplier = 1000
 const TickerDuration = 10
 
 var stableLeader = flag.Bool("ephemeral", false, "stable leader, if true paxos forward request to current leader")
@@ -56,14 +56,14 @@ type Replica struct {
 	*PigPaxos
 	relayGroups       []*PeerGroup
 	fixedRelays		  []paxi.ID
-	grayNodes		  map[paxi.ID]time.Time
 	myRelayGroup      int
 	NodeIdsToGroup    map[paxi.ID]int
 	numRelayGroups    int
 	maxDepth          uint8
 	relaySlack        int
 	cleanupMultiplier int
-	grayMultiplier    int
+
+	GrayNodes         map[paxi.ID]time.Time
 
 	p1bRelayRoutedMsg		  *RoutedMsg
 	pendingP1bRelay           int64
@@ -72,8 +72,8 @@ type Replica struct {
 	p2bRelaysMapByBalSlot     map[int]*RoutedMsg
 	p2bRelaysTimeMapByBalSlot map[int]int64
 
-	grayLock sync.RWMutex
 	sync.RWMutex
+	GrayLock sync.RWMutex
 }
 
 // NewReplica generates new Paxos replica
@@ -99,11 +99,10 @@ func NewReplica(id paxi.ID) *Replica {
 	r.p1bRelayDepth = 0
 	r.relaySlack = *rgSlack
 	r.cleanupMultiplier = 3
-	r.grayMultiplier = GrayTimeoutMultiplier
-	r.p2bRelaysMapByBalSlot = make(map[int]*RoutedMsg, paxi.GetConfig().BufferSize)
-	r.p2bRelaysTimeMapByBalSlot = make(map[int]int64, paxi.GetConfig().BufferSize)
+	r.p2bRelaysMapByBalSlot = make(map[int]*RoutedMsg)
+	r.p2bRelaysTimeMapByBalSlot = make(map[int]int64)
 	r.NodeIdsToGroup = make(map[paxi.ID]int)
-	r.grayNodes = make(map[paxi.ID]time.Time)
+	r.GrayNodes = make(map[paxi.ID]time.Time)
 
 	knownIDs := make([]paxi.ID, 0, len(paxi.GetConfig().Addrs))
 	for id := range paxi.GetConfig().Addrs {
@@ -144,7 +143,7 @@ func NewReplica(id paxi.ID) *Replica {
 			r.NodeIdsToGroup[id] = i
 		}
 		if *fixedrelay {
-			r.fixedRelays[i] = r.relayGroups[i].GetRandomNodeId(r.ID(), r.grayNodes)
+			r.fixedRelays[i] = r.relayGroups[i].GetRandomNodeId(r.ID(), r.GrayNodes)
 		}
 	}
 
@@ -186,35 +185,29 @@ func (r *Replica) startTicker() {
 	for now := range time.Tick(TickerDuration * time.Millisecond) {
 		// log cleanup
 		ticks++
-		log.Debugf("Ticker start on tick %d", ticks)
 		if ticks % uint64(r.cleanupMultiplier) == 0 {
 			r.CleanupLog()
 		}
 
-		log.Debugf("Ticker gray check on tick %d", ticks)
-		r.grayLock.Lock()
-		for grayId, t := range r.grayNodes {
-			if t.Add(time.Duration(TickerDuration * r.grayMultiplier) * time.Millisecond).Before(now) {
-				log.Infof("Removing node %v from gray list on timeout", grayId)
-				delete(r.grayNodes, grayId)
+		if ticks % uint64(GrayTimeoutMultiplier) == 0 {
+			log.Debugf("Ticker gray check on tick %d", ticks)
+			r.GrayLock.Lock()
+			for grayId, t := range r.GrayNodes {
+				if t.Add(time.Duration(TickerDuration*GrayTimeoutMultiplier) * time.Millisecond).Before(now) {
+					log.Infof("Removing node %v from gray list on timeout", grayId)
+					delete(r.GrayNodes, grayId)
+				}
 			}
+			r.GrayLock.Unlock()
+			log.Debugf("Ticker gray check done on tick %d", ticks)
 		}
-		r.grayLock.Unlock()
-		log.Debugf("Ticker gray check done on tick %d", ticks)
 
+		// handling timeouts
+		timeoutCutoffTime := now.Add(-time.Duration(*stdPigTimeout) * time.Millisecond).UnixNano() // everything older than this needs to timeout
+		//log.Debugf("Start TimeoutChecker (timeout_cutoff = %d)", timeoutCutoffTime)
 		if r.IsLeader() {
-			// handling timeouts. At the leader the timeout is twice the standard, since we need wait for timedout relays
-			timeoutCutoffTime := now.Add(-time.Duration(*stdPigTimeout * 2) * time.Millisecond).UnixNano() // everything older than this needs to timeout
-			r.CheckTimeout(timeoutCutoffTime, now)
+			r.CheckTimeout(timeoutCutoffTime)
 		} else {
-
-			// handling timeouts
-			timeoutCutoffTime := now.Add(-time.Duration(*stdPigTimeout) * time.Millisecond).UnixNano() // everything older than this needs to timeout
-			timeoutCutoffForRecoveryTime := now.Add(-time.Duration(*stdPigTimeout*4) * time.Millisecond).UnixNano() // uncommitted slots older than this need to recover
-
-			// check if RSM on follower is stuck and recover stuck slots. It may get stuck due to network failures (dropped messages)
-			// Messages my drop in PigPaxos due to relay faults
-			r.CheckNeedForRecovery(timeoutCutoffForRecoveryTime, now)
 			// check for P1b timeouts
 			r.Lock()
 			if r.p1bRelayRoutedMsg != nil {
@@ -234,41 +227,32 @@ func (r *Replica) startTicker() {
 			}
 			// check for p2b timeouts
 			for slot, routedP2b := range r.p2bRelaysMapByBalSlot {
-				log.Debugf("checking slot %d for timeout.", slot)
-				if r.lastLeaderExecSlot > slot {
-					// we know a leader has executed this slot already, so do not bother
-					log.Debugf("Slot %v is committed at leader, no need to reply with votes", slot)
+				if r.p2bRelaysTimeMapByBalSlot[slot] < timeoutCutoffTime {
+					routedP2b.IsForward = false
+					log.Debugf("Timeout on P2b. Relaying p2bs {%v}", r.p2bRelaysMapByBalSlot[slot])
+					if routedP2b.Progress == 0 {
+						p2b := routedP2b.Payload.(P2b)
+						if *useSmallP2b {
+							p2bSmall := P2bAggregated{
+								Ballot: p2b.Ballot,
+								Slot: p2b.Slot,
+								RelayLastExecute: r.execute - 1,
+								RelayID: r.ID(),
+								MissingIDs: r.computeMissingIDsForP2b(p2b),
+							}
+							r.Send(routedP2b.GetLastProgressHop(), p2bSmall)
+						} else {
+							r.Send(routedP2b.GetLastProgressHop(), routedP2b.Payload)
+						}
+					} else {
+						r.Send(routedP2b.GetLastProgressHop(), routedP2b)
+					}
 					delete(r.p2bRelaysMapByBalSlot, slot)
 					delete(r.p2bRelaysTimeMapByBalSlot, slot)
-				} else {
-					if r.p2bRelaysTimeMapByBalSlot[slot] < timeoutCutoffTime {
-						routedP2b.IsForward = false
-						log.Infof("Timeout on P2b. Relaying p2bs {%v}", r.p2bRelaysMapByBalSlot[slot])
-						if routedP2b.Progress == 0 {
-							p2b := routedP2b.Payload.(P2b)
-							if *useSmallP2b {
-								p2bSmall := P2bAggregated{
-									Ballot:           p2b.Ballot,
-									Slot:             p2b.Slot,
-									RelayLastExecute: r.execute - 1,
-									RelayID:          r.ID(),
-									MissingIDs:       r.computeMissingIDsForP2b(p2b),
-								}
-								r.Send(routedP2b.GetLastProgressHop(), p2bSmall)
-							} else {
-								r.Send(routedP2b.GetLastProgressHop(), routedP2b.Payload)
-							}
-						} else {
-							r.Send(routedP2b.GetLastProgressHop(), routedP2b)
-						}
-						delete(r.p2bRelaysMapByBalSlot, slot)
-						delete(r.p2bRelaysTimeMapByBalSlot, slot)
-					}
 				}
 			}
 			r.Unlock()
 		}
-		log.Debugf("Ticker end on tick %d", ticks)
 	}
 }
 
@@ -291,12 +275,11 @@ func (r *Replica) Broadcast(m interface{}) {
 		if *fixedrelay {
 			relayId = r.fixedRelays[i]
 		} else {
-			r.grayLock.RLock()
-			relayId = r.relayGroups[i].GetRandomNodeId(r.ID(), r.grayNodes)
-			r.grayLock.RUnlock()
+			r.GrayLock.RLock()
+			relayId = r.relayGroups[i].GetRandomNodeId(r.ID(), r.GrayNodes)
+			r.GrayLock.RUnlock()
 			log.Debugf("Generated Random Relay for RG #%d {%v}: %v",i, r.relayGroups[i], relayId)
 		}
-
 		r.Send(relayId, routedMsg)
 	}
 }
@@ -305,11 +288,11 @@ func (r *Replica) Broadcast(m interface{}) {
 func (r *Replica) BroadcastToPeerGroup(pg *PeerGroup, originalSourceToExclude paxi.ID, m RoutedMsg) {
 	log.Debugf("PigPaxos Broadcast to PeerGroup %v: {%v}", pg, m)
 	for _, id := range pg.nodes {
-		r.grayLock.RLock()
-		_, gray := r.grayNodes[id]
-		r.grayLock.RUnlock()
+		r.GrayLock.RLock()
+		_, gray := r.GrayNodes[id]
+		r.GrayLock.RUnlock()
 		if id != r.ID() && id != originalSourceToExclude && !gray {
-			r.Send(id, m)
+			go r.Send(id, m)
 		}
 	}
 }
@@ -322,12 +305,13 @@ func (r *Replica) Send(to paxi.ID, m interface{}) error {
 		err := r.Node.Send(to, m)
 		if err != nil {
 			// add node to gray list
-			r.grayLock.Lock()
+			r.GrayLock.Lock()
 			log.Infof("Adding node %v to gray list", to)
-			r.grayNodes[to] = time.Now()
-			r.grayLock.Unlock()
+			r.GrayNodes[to] = time.Now()
+			r.GrayLock.Unlock()
 		}
 	}
+
 	return nil
 }
 //*********************************************************************************************************************
@@ -360,7 +344,7 @@ func (r *Replica) handleRoutedMsg(m RoutedMsg) {
 			pgToBroadcast := r.relayGroups[r.myRelayGroup]
 			m.Hops = append(m.Hops, r.ID())
 			log.Debugf("Node %v forward propagating msg %v at depth %d and max depth %d", r.ID(), m, m.Progress, r.maxDepth)
-			go r.BroadcastToPeerGroup(pgToBroadcast, m.GetPreviousProgressHop(), m)
+			r.BroadcastToPeerGroup(pgToBroadcast, m.GetPreviousProgressHop(), m)
 		}
 	} else {
 		// backward propagation
@@ -447,7 +431,6 @@ func (r *Replica) handleP2aRelay(m P2a, routedMsg RoutedMsg) bool {
 		}
 		r.Unlock()
 		// self loop
-		log.Infof("Relay Node %v handling msg {%v}", r.ID(), m)
 		r.HandleP2a(m, r.ID())
 	}
 	return true
@@ -540,7 +523,7 @@ func (r *Replica) readyToRelayP1b(ballot paxi.Ballot, depth uint8) bool {
 
 func (r *Replica) handleP2b(m P2b) {
 	if r.IsLeader() {
-		// we received p2b reply, just handle it at the pigpaxos level
+		// we received p2b aggregated reply, so just handle it at the pigpaxos level
 		r.HandleP2b(m.Slot, m.Ballot, m.ID)
 	} else {
 		// here we handle the P2b coming from the leaf node
@@ -553,7 +536,7 @@ func (r *Replica) handleP2b(m P2b) {
 func (r *Replica) handleP2bAggregated(m P2bAggregated) {
 	log.Debugf("Handling P2bAggregated: %v", m)
 	if r.IsLeader() {
-		r.UpdateLastExecutedByNode(m.RelayID, m.RelayLastExecute)
+		r.UpdateLastExecuteByNode(m.RelayID, m.RelayLastExecute)
 		// we received p2b aggregated reply, so just handle it at the pigpaxos level
 		if m.MissingIDs != nil && len(m.MissingIDs) > 0 {
 			ids := make([]paxi.ID, len(r.relayGroups[r.NodeIdsToGroup[m.RelayID]].nodes))
